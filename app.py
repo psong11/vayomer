@@ -102,6 +102,7 @@ def list_whisper() -> list[dict]:
 
 ELEVEN_URL = "https://api.elevenlabs.io"
 _eleven_cache: list[dict] = []
+_eleven_error: str | None = None
 
 
 def list_voices() -> list[dict]:
@@ -112,20 +113,30 @@ def list_voices() -> list[dict]:
 
 
 def list_eleven() -> list[dict]:
-    """ElevenLabs voices, if a key is present. Cached; empty list is a valid answer."""
-    global _eleven_cache
+    """ElevenLabs voices, if a key is present. Records why it failed rather than
+    returning a bare empty list -- a silent [] here looks identical to 'no key'."""
+    global _eleven_cache, _eleven_error
     key = os.getenv("ELEVENLABS_API_KEY")
     if not key:
+        _eleven_error = None
         return []
     if not _eleven_cache:
         try:
             r = httpx.get(f"{ELEVEN_URL}/v2/voices", headers={"xi-api-key": key},
                           params={"page_size": 30}, timeout=15)
-            r.raise_for_status()
+            if r.status_code != 200:
+                try:
+                    why = r.json()["detail"]["message"]
+                except Exception:
+                    why = r.text[:140]
+                _eleven_error = f"ElevenLabs voices unavailable ({r.status_code}): {why}"
+                return []
             _eleven_cache = [{"id": f"11l:{v['voice_id']}",
                               "label": f"{v.get('name', v['voice_id'])}  (ElevenLabs)"}
                              for v in r.json().get("voices", [])]
-        except Exception:
+            _eleven_error = None
+        except Exception as e:
+            _eleven_error = f"ElevenLabs voices unavailable: {type(e).__name__}: {e}"
             return []
     return _eleven_cache
 
@@ -349,8 +360,9 @@ async def warm() -> None:
 
 @app.get("/models")
 async def models():
-    return {"whisper": list_whisper(), "voices": list_voices(),
-            "claude": list_claude(), "active": config}
+    voices = list_voices()
+    return {"whisper": list_whisper(), "voices": voices,
+            "claude": list_claude(), "active": config, "notice": _eleven_error}
 
 
 @app.post("/config")

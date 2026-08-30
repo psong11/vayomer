@@ -175,6 +175,7 @@ async function loadModels(){
       };
     };
     fill("whisper",m.whisper); fill("claude",m.claude); fill("voice",m.voices);
+    if(m.notice) show("err", m.notice);
   }catch(e){ show("err","Could not load the model list: "+e.message); }
 }
 loadModels();
