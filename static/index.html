@@ -43,6 +43,22 @@
   button:active{transform:scale(.97)}
   button:disabled{opacity:.5; cursor:not-allowed}
   button:focus-visible{outline:2px solid var(--ink); outline-offset:3px}
+  .settings{
+    width:100%; max-width:640px; display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px;
+  }
+  .settings label{
+    display:flex; flex-direction:column; gap:5px;
+    font:600 10px/1 ui-monospace,Menlo,monospace; letter-spacing:.18em;
+    text-transform:uppercase; color:var(--dim);
+  }
+  .settings select{
+    appearance:none; width:100%; background:var(--panel); color:var(--ink);
+    border:1px solid var(--line); border-radius:9px; padding:10px 12px;
+    font:13px/1.2 ui-monospace,Menlo,monospace; cursor:pointer;
+  }
+  .settings select:hover{border-color:var(--dim)}
+  .settings select:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
   .io{width:100%; max-width:640px; display:flex; flex-direction:column; gap:12px}
   .card{
     background:var(--panel); border:1px solid var(--line); border-radius:12px;
@@ -58,7 +74,7 @@
   .card.err{border-left:3px solid var(--err)} .card.err p{color:var(--err)}
   .timings{
     font:11px/1.5 ui-monospace,Menlo,monospace; color:var(--dim);
-    letter-spacing:.04em; text-align:center; min-height:16px;
+    letter-spacing:.04em; text-align:center; min-height:16px; white-space:pre-line;
   }
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -72,6 +88,12 @@
     <button id="btn">Start talking</button>
   </div>
 
+  <div class="settings">
+    <label>Hearing<select id="m-whisper"></select></label>
+    <label>Thinking<select id="m-claude"></select></label>
+    <label>Voice<select id="m-voice"></select></label>
+  </div>
+
   <div class="io">
     <div class="card" id="c-you"><h2>You said</h2><p id="you"></p></div>
     <div class="card reply" id="c-reply"><h2>Claude</h2><p id="reply"></p></div>
@@ -82,7 +104,7 @@
 <script>
 const btn=document.getElementById("btn"), statusEl=document.getElementById("status");
 const cv=document.getElementById("viz"), ctx=cv.getContext("2d");
-const N=88, levels=new Array(N).fill(0);
+const N=88, IDLE=0.018, levels=new Array(N).fill(IDLE);
 let recording=false, busy=false, accentVar="--idle";
 
 const COLORS={idle:"--idle",listening:"--listen",converting:"--think",
@@ -96,8 +118,8 @@ function draw(){
   const bw=w/N, gap=bw*0.34;
   ctx.fillStyle=css(accentVar)||"#7d8b96";
   for(let i=0;i<N;i++){
-    const v=levels[i];
-    const bar=Math.max(2, v*(h*0.92));
+    const v = Number.isFinite(levels[i]) ? levels[i] : IDLE;
+    const bar=Math.max(3, v*(h*0.92));
     ctx.globalAlpha=0.35+0.65*Math.min(1,v*2.2);
     ctx.beginPath();
     const x=i*bw+gap/2, ww=bw-gap, r=Math.min(ww/2,3);
@@ -112,8 +134,12 @@ requestAnimationFrame(draw);
 const es=new EventSource("/events");
 es.onmessage=e=>{
   const d=JSON.parse(e.data);
+  // Read the tail BEFORE shifting: after shift() index N-1 no longer exists, and
+  // undefined*0.86 is NaN, which poisons the whole array and draws nothing.
+  const tail = levels[levels.length - 1];
   levels.shift();
-  levels.push(d.recording ? d.level : Math.max(0, levels[N-1]*0.82));
+  const next = d.recording ? d.level : (Number.isFinite(tail) ? tail * 0.86 : IDLE);
+  levels.push(Math.max(IDLE, Number.isFinite(next) ? next : IDLE));
   accentVar=COLORS[d.status]||"--idle";
   document.documentElement.style.setProperty("--accent", `var(${accentVar})`);
   if(!busy || d.status!=="idle") statusEl.textContent=d.status==="idle"?"ready":d.status+"…";
@@ -124,6 +150,34 @@ function show(id,txt){
   document.getElementById(id).textContent=txt||"";
   card.classList.toggle("on", !!txt);
 }
+
+const SEL={whisper:"m-whisper", claude:"m-claude", voice:"m-voice"};
+async function loadModels(){
+  try{
+    const m=await (await fetch("/models")).json();
+    const fill=(key,items)=>{
+      const el=document.getElementById(SEL[key]);
+      el.innerHTML="";
+      items.forEach(it=>{
+        const o=document.createElement("option");
+        o.value=it.id;
+        o.textContent=it.label+(it.mb?`  ·  ${it.mb} MB`:"");
+        if(it.id===m.active[key]) o.selected=true;
+        el.appendChild(o);
+      });
+      el.onchange=async()=>{
+        el.disabled=true;
+        const r=await fetch("/config",{method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({[key]:el.value})});
+        if(!r.ok){ const d=await r.json(); show("err",d.error||"could not switch"); }
+        el.disabled=false;
+      };
+    };
+    fill("whisper",m.whisper); fill("claude",m.claude); fill("voice",m.voices);
+  }catch(e){ show("err","Could not load the model list: "+e.message); }
+}
+loadModels();
 
 btn.onclick=async()=>{
   if(busy) return;
@@ -141,9 +195,10 @@ btn.onclick=async()=>{
       const d=await r.json();
       show("you", d.transcript); show("reply", d.reply); show("err", d.error);
       if(d.timings&&d.timings.total){
-        const t=d.timings;
+        const t=d.timings, u=d.used||{};
         document.getElementById("timings").textContent=
-          `whisper ${t.whisper}s · claude ${t.claude}s · piper ${t.piper}s · total ${t.total}s`;
+          `whisper ${t.whisper}s · claude ${t.claude}s · piper ${t.piper}s · total ${t.total}s`
+          + (u.claude? `\n${u.whisper} · ${u.claude} · ${u.voice}` : "");
       }
     }catch(err){ show("err","Request failed: "+err.message); }
     busy=false; btn.disabled=false; btn.textContent="Start talking";

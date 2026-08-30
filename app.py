@@ -24,8 +24,15 @@ load_dotenv(ROOT / ".env")
 
 CAPTURE_DEV = os.getenv("CAPTURE_DEV", "hw:2,0")   # raw card; softvol is playback-only
 WHISPER_BIN = ROOT / "whisper.cpp/build/bin/whisper-cli"
-WHISPER_MODEL = Path(os.getenv("WHISPER_MODEL", ROOT / "whisper.cpp/models/ggml-base.en.bin"))
-PIPER_VOICE = Path(os.getenv("PIPER_VOICE", ROOT / "voices/en_US-lessac-medium.onnx"))
+WHISPER_DIR = ROOT / "whisper.cpp/models"
+VOICE_DIR = ROOT / "voices"
+WHISPER_MODEL = Path(os.getenv("WHISPER_MODEL", WHISPER_DIR / "ggml-base.en.bin"))
+PIPER_VOICE = Path(os.getenv("PIPER_VOICE", VOICE_DIR / "en_US-lessac-medium.onnx"))
+
+# Live, switchable from the dashboard. Applies to the next turn.
+config = {"whisper": WHISPER_MODEL.name,
+          "voice": PIPER_VOICE.stem,
+          "claude": os.getenv("CLAUDE_MODEL", "claude-opus-5")}
 VENV_PY = ROOT / ".venv/bin/python"
 WORK = ROOT / "work"
 WORK.mkdir(exist_ok=True)
@@ -50,10 +57,45 @@ _proc: subprocess.Popen | None = None
 _thread: threading.Thread | None = None
 
 client = anthropic.Anthropic()
-# Loaded once at startup. Shelling out to `python -m piper` per reply re-read the
-# 63 MB ONNX model every time, which cost ~2.4 s of the round trip.
-voice = PiperVoice.load(str(PIPER_VOICE))
 app = FastAPI()
+
+# Loaded once and cached per voice. Shelling out to `python -m piper` per reply
+# re-read the 63 MB ONNX model every time, which cost ~2.4 s of the round trip.
+_voice_cache: dict[str, PiperVoice] = {}
+_claude_models: list[dict] = []
+
+
+def get_voice(stem: str) -> PiperVoice:
+    if stem not in _voice_cache:
+        _voice_cache[stem] = PiperVoice.load(str(VOICE_DIR / f"{stem}.onnx"))
+    return _voice_cache[stem]
+
+
+def list_whisper() -> list[dict]:
+    out = []
+    for f in sorted(WHISPER_DIR.glob("ggml-*.bin")):
+        if f.name.startswith("ggml-") and "for-tests" not in f.name:
+            out.append({"id": f.name,
+                        "label": f.stem.replace("ggml-", ""),
+                        "mb": round(f.stat().st_size / 1e6)})
+    return out
+
+
+def list_voices() -> list[dict]:
+    return [{"id": f.stem, "label": f.stem.replace("_", " "),
+             "mb": round(f.stat().st_size / 1e6)}
+            for f in sorted(VOICE_DIR.glob("*.onnx"))]
+
+
+def list_claude() -> list[dict]:
+    global _claude_models
+    if not _claude_models:
+        try:
+            _claude_models = [{"id": m.id, "label": m.display_name}
+                              for m in client.models.list(limit=20)]
+        except Exception:
+            _claude_models = [{"id": "claude-opus-5", "label": "Claude Opus 5"}]
+    return _claude_models
 
 
 def _capture_loop() -> None:
@@ -111,8 +153,8 @@ def _pipeline() -> dict:
 
     state["status"] = "transcribing"
     s = time.time()
-    out = _run([str(WHISPER_BIN), "-m", str(WHISPER_MODEL), "-f", str(mono),
-                "-t", "4", "-nt"])
+    out = _run([str(WHISPER_BIN), "-m", str(WHISPER_DIR / config["whisper"]),
+                "-f", str(mono), "-t", "4", "-nt"])
     transcript = " ".join(out.stdout.split()).strip()
     t["whisper"] = round(time.time() - s, 2)
     state["transcript"] = transcript
@@ -129,7 +171,7 @@ def _pipeline() -> dict:
             "sudo systemctl restart voice-loop")
     s = time.time()
     resp = client.beta.messages.create(
-        model="claude-opus-5",
+        model=config["claude"],
         max_tokens=1024,
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
@@ -148,7 +190,7 @@ def _pipeline() -> dict:
     s = time.time()
     spoken = WORK / f"{stamp}_reply.wav"
     with wave.open(str(spoken), "wb") as wf:
-        voice.synthesize_wav(reply, wf)
+        get_voice(config["voice"]).synthesize_wav(reply, wf)
     t["piper"] = round(time.time() - s, 2)
     # No -D: goes through `default`, which is where the softvol volume lives.
     subprocess.run(["aplay", "-q", str(spoken)], check=False)
@@ -156,7 +198,8 @@ def _pipeline() -> dict:
     t["total"] = round(sum(v for k, v in t.items() if k != "total"), 2)
     state["timings"] = t
     state["status"] = "idle"
-    return {"transcript": transcript, "reply": reply, "timings": t}
+    return {"transcript": transcript, "reply": reply, "timings": t,
+            "used": dict(config)}
 
 
 @app.post("/start")
@@ -222,6 +265,25 @@ async def events(request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
+
+
+@app.get("/models")
+async def models():
+    return {"whisper": list_whisper(), "voices": list_voices(),
+            "claude": list_claude(), "active": config}
+
+
+@app.post("/config")
+async def set_config(body: dict):
+    for k in ("whisper", "voice", "claude"):
+        if k in body and body[k]:
+            config[k] = body[k]
+    if "voice" in body and body["voice"]:
+        try:
+            get_voice(config["voice"])          # warm it so the next turn is fast
+        except Exception as e:
+            return JSONResponse({"error": f"could not load voice: {e}"}, status_code=400)
+    return {"active": config}
 
 
 @app.get("/")
