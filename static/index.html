@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>voice-loop · petsi</title>
+<style>
+  :root{
+    --bg:#0d1115; --panel:#151c22; --line:#232d36;
+    --ink:#e4eaef; --dim:#7d8b96;
+    --idle:#7d8b96; --listen:#43d6a0; --think:#e8b13d; --speak:#a688f5; --err:#ff7b72;
+    --accent:var(--idle);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+    display:flex; flex-direction:column; align-items:center;
+    padding:28px 20px 40px; gap:22px;
+  }
+  h1{
+    font-size:13px; letter-spacing:.22em; text-transform:uppercase;
+    color:var(--dim); font-weight:600; margin:0;
+  }
+  .stage{
+    width:100%; max-width:640px; background:var(--panel);
+    border:1px solid var(--line); border-radius:14px; padding:22px;
+    display:flex; flex-direction:column; gap:18px; align-items:center;
+  }
+  canvas{width:100%; height:120px; display:block}
+  .status{
+    font:600 13px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+    letter-spacing:.16em; text-transform:uppercase; color:var(--accent);
+    transition:color .25s; min-height:14px;
+  }
+  button{
+    appearance:none; border:0; cursor:pointer; font:600 17px/1 inherit;
+    color:#0d1115; background:var(--accent); padding:16px 42px; border-radius:999px;
+    transition:background .25s, transform .08s; letter-spacing:.01em;
+  }
+  button:hover{filter:brightness(1.08)}
+  button:active{transform:scale(.97)}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  button:focus-visible{outline:2px solid var(--ink); outline-offset:3px}
+  .io{width:100%; max-width:640px; display:flex; flex-direction:column; gap:12px}
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:15px 18px; display:none; flex-direction:column; gap:6px;
+  }
+  .card.on{display:flex}
+  .card h2{
+    margin:0; font:600 10px/1 ui-monospace,Menlo,monospace;
+    letter-spacing:.2em; text-transform:uppercase; color:var(--dim);
+  }
+  .card p{margin:0; white-space:pre-wrap}
+  .card.reply{border-left:3px solid var(--speak)}
+  .card.err{border-left:3px solid var(--err)} .card.err p{color:var(--err)}
+  .timings{
+    font:11px/1.5 ui-monospace,Menlo,monospace; color:var(--dim);
+    letter-spacing:.04em; text-align:center; min-height:16px;
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+  <h1>voice&#8209;loop · petsi</h1>
+
+  <div class="stage">
+    <canvas id="viz" width="1200" height="240" aria-hidden="true"></canvas>
+    <div class="status" id="status">ready</div>
+    <button id="btn">Start talking</button>
+  </div>
+
+  <div class="io">
+    <div class="card" id="c-you"><h2>You said</h2><p id="you"></p></div>
+    <div class="card reply" id="c-reply"><h2>Claude</h2><p id="reply"></p></div>
+    <div class="card err" id="c-err"><h2>Problem</h2><p id="err"></p></div>
+    <div class="timings" id="timings"></div>
+  </div>
+
+<script>
+const btn=document.getElementById("btn"), statusEl=document.getElementById("status");
+const cv=document.getElementById("viz"), ctx=cv.getContext("2d");
+const N=88, levels=new Array(N).fill(0);
+let recording=false, busy=false, accentVar="--idle";
+
+const COLORS={idle:"--idle",listening:"--listen",converting:"--think",
+              transcribing:"--think",thinking:"--think",speaking:"--speak"};
+
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+
+function draw(){
+  const w=cv.width,h=cv.height,mid=h/2;
+  ctx.clearRect(0,0,w,h);
+  const bw=w/N, gap=bw*0.34;
+  ctx.fillStyle=css(accentVar)||"#7d8b96";
+  for(let i=0;i<N;i++){
+    const v=levels[i];
+    const bar=Math.max(2, v*(h*0.92));
+    ctx.globalAlpha=0.35+0.65*Math.min(1,v*2.2);
+    ctx.beginPath();
+    const x=i*bw+gap/2, ww=bw-gap, r=Math.min(ww/2,3);
+    ctx.roundRect(x, mid-bar/2, ww, bar, r);
+    ctx.fill();
+  }
+  ctx.globalAlpha=1;
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+const es=new EventSource("/events");
+es.onmessage=e=>{
+  const d=JSON.parse(e.data);
+  levels.shift();
+  levels.push(d.recording ? d.level : Math.max(0, levels[N-1]*0.82));
+  accentVar=COLORS[d.status]||"--idle";
+  document.documentElement.style.setProperty("--accent", `var(${accentVar})`);
+  if(!busy || d.status!=="idle") statusEl.textContent=d.status==="idle"?"ready":d.status+"…";
+};
+
+function show(id,txt){
+  const card=document.getElementById("c-"+id);
+  document.getElementById(id).textContent=txt||"";
+  card.classList.toggle("on", !!txt);
+}
+
+btn.onclick=async()=>{
+  if(busy) return;
+  if(!recording){
+    show("you",""); show("reply",""); show("err","");
+    document.getElementById("timings").textContent="";
+    const r=await fetch("/start",{method:"POST"});
+    if(!r.ok){show("err","Could not start the microphone.");return;}
+    recording=true; btn.textContent="Stop and send";
+  }else{
+    recording=false; busy=true;
+    btn.disabled=true; btn.textContent="Working…";
+    try{
+      const r=await fetch("/stop",{method:"POST"});
+      const d=await r.json();
+      show("you", d.transcript); show("reply", d.reply); show("err", d.error);
+      if(d.timings&&d.timings.total){
+        const t=d.timings;
+        document.getElementById("timings").textContent=
+          `whisper ${t.whisper}s · claude ${t.claude}s · piper ${t.piper}s · total ${t.total}s`;
+      }
+    }catch(err){ show("err","Request failed: "+err.message); }
+    busy=false; btn.disabled=false; btn.textContent="Start talking";
+    statusEl.textContent="ready";
+  }
+};
+</script>
+</body>
+</html>

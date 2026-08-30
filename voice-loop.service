@@ -1,0 +1,15 @@
+[Unit]
+Description=voice-loop (I2S mic -> whisper.cpp -> Claude -> piper -> speaker)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=paul
+WorkingDirectory=/home/paul/voice-loop
+ExecStart=/home/paul/voice-loop/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

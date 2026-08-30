@@ -1,0 +1,6 @@
+.env
+.venv/
+work/
+voices/
+whisper.cpp/
+__pycache__/
