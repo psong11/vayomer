@@ -43,6 +43,48 @@
   button:active{transform:scale(.97)}
   button:disabled{opacity:.5; cursor:not-allowed}
   button:focus-visible{outline:2px solid var(--ink); outline-offset:3px}
+  .flowwrap{width:100%; max-width:640px; display:flex; flex-direction:column; gap:9px}
+  .flow{display:flex; width:100%; overflow-x:auto; padding:2px 0 0}
+  .node{
+    flex:1 1 0; min-width:82px; display:flex; flex-direction:column;
+    align-items:center; gap:5px; position:relative; text-align:center;
+  }
+  .node + .node::before{
+    content:""; position:absolute; left:-50%; top:8px; width:100%; height:2px;
+    background:var(--line); z-index:0;
+  }
+  .node[data-state="done"]::before{background:var(--listen)}
+  .node[data-state="active"]::before{background:var(--accent)}
+  .node[data-state="failed"]::before{background:var(--err)}
+  .dot{
+    width:18px; height:18px; border-radius:50%; background:var(--bg);
+    border:2px solid var(--line); z-index:1; transition:background .2s,border-color .2s;
+  }
+  .node[data-remote="true"] .dot{border-style:dashed}
+  .node[data-state="done"] .dot{background:var(--listen); border-color:var(--listen)}
+  .node[data-state="active"] .dot{
+    background:var(--accent); border-color:var(--accent);
+    animation:pulse 1.1s ease-in-out infinite;
+  }
+  .node[data-state="failed"] .dot{background:var(--err); border-color:var(--err)}
+  @keyframes pulse{
+    0%,100%{box-shadow:0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent)}
+    50%    {box-shadow:0 0 0 7px color-mix(in srgb, var(--accent) 0%, transparent)}
+  }
+  .nlab{
+    font:600 9.5px/1 ui-monospace,Menlo,monospace; letter-spacing:.13em;
+    text-transform:uppercase; color:var(--dim);
+  }
+  .node[data-state="active"] .nlab{color:var(--accent)}
+  .node[data-state="done"] .nlab{color:var(--ink)}
+  .ninfo{font:11px/1.25 ui-monospace,Menlo,monospace; color:var(--dim);
+    max-width:96px; overflow-wrap:anywhere; min-height:14px}
+  .ntime{font:600 11px/1 ui-monospace,Menlo,monospace; color:var(--listen);
+    font-variant-numeric:tabular-nums; min-height:12px}
+  .flownote{
+    margin:0; text-align:center; font:10px/1 ui-monospace,Menlo,monospace;
+    letter-spacing:.08em; color:var(--dim); opacity:.8;
+  }
   .settings{
     width:100%; max-width:640px; display:grid;
     grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px;
@@ -88,6 +130,11 @@
     <button id="btn">Start talking</button>
   </div>
 
+  <div class="flowwrap">
+    <div class="flow" id="flow" role="img" aria-label="Pipeline progress"></div>
+    <p class="flownote">solid ring = runs on petsi · dashed ring = leaves the box</p>
+  </div>
+
   <div class="settings">
     <label>Hearing<select id="m-whisper"></select></label>
     <label>Thinking<select id="m-claude"></select></label>
@@ -108,7 +155,8 @@ const N=88, IDLE=0.018, levels=new Array(N).fill(IDLE);
 let recording=false, busy=false, accentVar="--idle";
 
 const COLORS={idle:"--idle",listening:"--listen",converting:"--think",
-              transcribing:"--think",thinking:"--think",speaking:"--speak"};
+              transcribing:"--think",thinking:"--think",speaking:"--speak",
+              playing:"--speak"};
 
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 
@@ -131,6 +179,29 @@ function draw(){
 }
 requestAnimationFrame(draw);
 
+const FLOW=[["capture","mic"],["convert","resample"],["whisper","whisper"],
+            ["claude","claude"],["tts","voice"],["speaker","speaker"]];
+const flowEl=document.getElementById("flow");
+FLOW.forEach(([key,label])=>{
+  const n=document.createElement("div");
+  n.className="node"; n.id="n-"+key;
+  n.dataset.state="pending"; n.dataset.remote="false";
+  n.innerHTML='<div class="dot"></div><div class="nlab">'+label+
+              '</div><div class="ninfo"></div><div class="ntime"></div>';
+  flowEl.appendChild(n);
+});
+function renderFlow(stages){
+  if(!stages) return;
+  for(const [key] of FLOW){
+    const sg=stages[key]; if(!sg) continue;
+    const n=document.getElementById("n-"+key);
+    n.dataset.state=sg.state;
+    n.dataset.remote=sg.remote?"true":"false";
+    n.querySelector(".ninfo").textContent=sg.info||"";
+    n.querySelector(".ntime").textContent=(sg.t!=null&&sg.state==="done")?sg.t+"s":"";
+  }
+}
+
 const es=new EventSource("/events");
 es.onmessage=e=>{
   const d=JSON.parse(e.data);
@@ -142,6 +213,7 @@ es.onmessage=e=>{
   levels.push(Math.max(IDLE, Number.isFinite(next) ? next : IDLE));
   accentVar=COLORS[d.status]||"--idle";
   document.documentElement.style.setProperty("--accent", `var(${accentVar})`);
+  renderFlow(d.stages);
   if(!busy || d.status!=="idle") statusEl.textContent=d.status==="idle"?"ready":d.status+"…";
 };
 

@@ -66,8 +66,31 @@ SYSTEM = (
     "more room to answer well, take it, but never pad."
 )
 
+# The pipeline as the UI draws it. Each stage carries what happened there, so the
+# dashboard is a live window into the backend rather than a spinner.
+STAGES = ["capture", "convert", "whisper", "claude", "tts", "speaker"]
+
 state = {"recording": False, "level": 0.0, "status": "idle",
-         "transcript": "", "reply": "", "timings": {}}
+         "transcript": "", "reply": "", "timings": {}, "stages": {}}
+
+
+def reset_stages() -> None:
+    state["stages"] = {k: {"state": "pending", "t": None, "info": None}
+                       for k in STAGES}
+
+
+def stage(name: str, st: str, info: str | None = None,
+          t: float | None = None) -> None:
+    sg = state["stages"].setdefault(
+        name, {"state": "pending", "t": None, "info": None})
+    sg["state"] = st
+    if info is not None:
+        sg["info"] = info
+    if t is not None:
+        sg["t"] = round(t, 2)
+
+
+reset_stages()
 
 _buf = bytearray()
 _buf_lock = threading.Lock()
@@ -142,6 +165,15 @@ def list_eleven() -> list[dict]:
             _eleven_error = f"ElevenLabs voices unavailable: {type(e).__name__}: {e}"
             return []
     return _eleven_cache
+
+
+def voice_label(voice_id: str) -> str:
+    """Friendly name for the flow diagram: an ElevenLabs id means nothing to a reader."""
+    for v in list_voices():
+        if v["id"] == voice_id:
+            name = v["label"].split("  (")[0]
+            return name.split(" - ")[0].strip()[:20]
+    return voice_id.split(":", 1)[-1][:20]
 
 
 def synthesize(text: str, voice_id: str, out_path: Path) -> None:
@@ -261,19 +293,23 @@ def _pipeline() -> dict:
 
     # Take the LEFT channel explicitly. Plain -ac 1 averages L+R, and since the
     # right slot is silence that would quietly cost 6 dB of signal.
+    stage("convert", "active")
     state["status"] = "converting"
     mono = WORK / f"{stamp}_16k.wav"
     s = time.time()
     _run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw_wav),
           "-af", "pan=mono|c0=c0", "-ar", "16000", "-ac", "1", str(mono)])
     t["convert"] = round(time.time() - s, 2)
+    stage("convert", "done", "48k stereo \u2192 16k mono", t["convert"])
 
+    stage("whisper", "active", config["whisper"].replace("ggml-", "").replace(".bin", ""))
     state["status"] = "transcribing"
     s = time.time()
     out = _run([str(WHISPER_BIN), "-m", str(WHISPER_DIR / config["whisper"]),
                 "-f", str(mono), "-t", "4", "-nt"], env=WHISPER_ENV)
     transcript = " ".join(out.stdout.split()).strip()
     t["whisper"] = round(time.time() - s, 2)
+    stage("whisper", "done", f"{len(transcript.split())} words", t["whisper"])
     state["transcript"] = transcript
 
     if not transcript or transcript in ("[BLANK_AUDIO]", "(blank audio)"):
@@ -281,6 +317,7 @@ def _pipeline() -> dict:
         return {"transcript": "", "reply": "", "timings": t,
                 "error": "Didn't catch any speech in that."}
 
+    stage("claude", "active", config["claude"])
     state["status"] = "thinking"
     if not os.getenv("ANTHROPIC_API_KEY"):
         raise RuntimeError(
@@ -293,17 +330,31 @@ def _pipeline() -> dict:
     else:
         reply = "".join(b.text for b in resp.content if b.type == "text").strip()
     t["claude"] = round(time.time() - s, 2)
+    stage("claude", "done", f"{len(reply)} chars back", t["claude"])
     state["reply"] = reply
 
+    vlabel = voice_label(config["voice"])
+    stage("tts", "active", vlabel)
     state["status"] = "speaking"
     s = time.time()
     spoken = WORK / f"{stamp}_reply.wav"
     synthesize(reply, config["voice"], spoken)
     t["tts"] = round(time.time() - s, 2)
+    with wave.open(str(spoken), "rb") as _w:
+        spoken_secs = _w.getnframes() / _w.getframerate()
+    stage("tts", "done", vlabel, t["tts"])
+
+    stage("speaker", "active", f"{spoken_secs:.1f}s out")
+    state["status"] = "playing"
+    s = time.time()
     # No -D: goes through `default`, which is where the softvol volume lives.
     subprocess.run(["aplay", "-q", str(spoken)], check=False)
+    t["play"] = round(time.time() - s, 2)
+    stage("speaker", "done", f"{spoken_secs:.1f}s out", t["play"])
 
-    t["total"] = round(sum(v for k, v in t.items() if k != "total"), 2)
+    # `play` is how long the reply takes to speak aloud, not latency -- keep it
+    # visible per-stage but out of the total, which is time-to-first-sound.
+    t["total"] = round(sum(v for k, v in t.items() if k not in ("total", "play")), 2)
     state["timings"] = t
     state["status"] = "idle"
     return {"transcript": transcript, "reply": reply, "timings": t,
@@ -317,6 +368,8 @@ async def start():
         return JSONResponse({"error": "already recording"}, status_code=409)
     with _buf_lock:
         _buf.clear()
+    reset_stages()
+    stage("capture", "active", "mic open")
     state.update(recording=True, status="listening", transcript="", reply="", timings={})
     _thread = threading.Thread(target=_capture_loop, daemon=True)
     _thread.start()
@@ -332,16 +385,24 @@ async def stop():
         _proc.terminate()                 # unblocks the thread's pending read
     if _thread:
         _thread.join(timeout=3)
+    secs = len(_buf) / (RATE * CHANNELS * WIDTH)
+    stage("capture", "done", f"{secs:.1f}s audio", secs)
     state["status"] = "converting"
     try:
         return await asyncio.to_thread(_pipeline)
     except subprocess.CalledProcessError as e:
+        for k, v in state["stages"].items():
+            if v["state"] == "active":
+                v["state"] = "failed"
         state["status"] = "idle"
         detail = (e.stderr or "").strip().splitlines()[-1:] or [str(e)]
         return JSONResponse({"transcript": state["transcript"],
                              "error": f"{Path(e.cmd[0]).name} failed: {detail[0]}"},
                             status_code=500)
     except anthropic.APIStatusError as e:
+        for k, v in state["stages"].items():
+            if v["state"] == "active":
+                v["state"] = "failed"
         state["status"] = "idle"
         try:
             detail = e.response.json()["error"]["message"]
@@ -352,6 +413,9 @@ async def stop():
                              "error": f"Claude API {e.status_code}: {detail}{hint}"},
                             status_code=500)
     except Exception as e:
+        for k, v in state["stages"].items():
+            if v["state"] == "active":
+                v["state"] = "failed"
         state["status"] = "idle"
         msg = str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
         return JSONResponse({"transcript": state["transcript"], "error": msg},
@@ -367,10 +431,16 @@ async def events(request: Request):
                 # makes `systemctl restart` hang waiting for the connection.
                 if await request.is_disconnected():
                     return
+                remote_tts = config["voice"].startswith("11l:")
+                stages = {
+                    k: {**v, "remote": k == "claude" or (k == "tts" and remote_tts)}
+                    for k, v in state["stages"].items()
+                }
                 yield "data: " + json.dumps({
                     "recording": state["recording"],
                     "level": round(state["level"], 4),
                     "status": state["status"],
+                    "stages": stages,
                 }) + "\n\n"
                 await asyncio.sleep(0.05)
         except asyncio.CancelledError:
