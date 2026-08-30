@@ -333,6 +333,16 @@ async def events(request: Request):
                                       "X-Accel-Buffering": "no"})
 
 
+@app.on_event("startup")
+async def warm() -> None:
+    """Preload the configured local voice off the request path, so the first
+    reply after a restart doesn't pay the ONNX load (~2-3 s for a -high voice)."""
+    if config["voice"].startswith("piper:"):
+        threading.Thread(
+            target=lambda: get_voice(config["voice"].split(":", 1)[1]),
+            daemon=True).start()
+
+
 @app.get("/models")
 async def models():
     return {"whisper": list_whisper(), "voices": list_voices(),
