@@ -77,13 +77,17 @@ app = FastAPI()
 # Loaded once and cached per voice. Shelling out to `python -m piper` per reply
 # re-read the 63 MB ONNX model every time, which cost ~2.4 s of the round trip.
 _voice_cache: dict[str, PiperVoice] = {}
+_voice_lock = threading.Lock()
 _claude_models: list[dict] = []
 
 
 def get_voice(stem: str) -> PiperVoice:
-    if stem not in _voice_cache:
-        _voice_cache[stem] = PiperVoice.load(str(VOICE_DIR / f"{stem}.onnx"))
-    return _voice_cache[stem]
+    # Locked: the startup warmer and a request can ask for the same voice at once,
+    # and without this they each start a separate 114 MB ONNX load and fight for CPU.
+    with _voice_lock:
+        if stem not in _voice_cache:
+            _voice_cache[stem] = PiperVoice.load(str(VOICE_DIR / f"{stem}.onnx"))
+        return _voice_cache[stem]
 
 
 def list_whisper() -> list[dict]:
