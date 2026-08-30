@@ -197,7 +197,7 @@ btn.onclick=async()=>{
       if(d.timings&&d.timings.total){
         const t=d.timings, u=d.used||{};
         document.getElementById("timings").textContent=
-          `whisper ${t.whisper}s · claude ${t.claude}s · piper ${t.piper}s · total ${t.total}s`
+          `whisper ${t.whisper}s · claude ${t.claude}s · tts ${t.tts}s · total ${t.total}s`
           + (u.claude? `\n${u.whisper} · ${u.claude} · ${u.voice}` : "");
       }
     }catch(err){ show("err","Request failed: "+err.message); }

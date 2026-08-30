@@ -13,6 +13,7 @@ import wave
 from pathlib import Path
 
 import anthropic
+import httpx
 import numpy as np
 from piper import PiperVoice
 from dotenv import load_dotenv
@@ -29,10 +30,24 @@ VOICE_DIR = ROOT / "voices"
 WHISPER_MODEL = Path(os.getenv("WHISPER_MODEL", WHISPER_DIR / "ggml-base.en.bin"))
 PIPER_VOICE = Path(os.getenv("PIPER_VOICE", VOICE_DIR / "en_US-lessac-medium.onnx"))
 
-# Live, switchable from the dashboard. Applies to the next turn.
+# Live, switchable from the dashboard. Applies to the next turn, and survives
+# a restart so a service bounce doesn't silently reset your picks.
+CONFIG_FILE = ROOT / "work/config.json"
 config = {"whisper": WHISPER_MODEL.name,
-          "voice": PIPER_VOICE.stem,
+          "voice": f"piper:{PIPER_VOICE.stem}",
           "claude": os.getenv("CLAUDE_MODEL", "claude-opus-5")}
+try:
+    config.update({k: v for k, v in json.loads(CONFIG_FILE.read_text()).items()
+                   if k in config})
+except Exception:
+    pass
+
+
+def save_config() -> None:
+    try:
+        CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    except OSError:
+        pass
 VENV_PY = ROOT / ".venv/bin/python"
 WORK = ROOT / "work"
 WORK.mkdir(exist_ok=True)
@@ -81,10 +96,62 @@ def list_whisper() -> list[dict]:
     return out
 
 
+ELEVEN_URL = "https://api.elevenlabs.io"
+_eleven_cache: list[dict] = []
+
+
 def list_voices() -> list[dict]:
-    return [{"id": f.stem, "label": f.stem.replace("_", " "),
-             "mb": round(f.stat().st_size / 1e6)}
-            for f in sorted(VOICE_DIR.glob("*.onnx"))]
+    local = [{"id": f"piper:{f.stem}", "label": f"{f.stem}  (local)",
+              "mb": round(f.stat().st_size / 1e6)}
+             for f in sorted(VOICE_DIR.glob("*.onnx"))]
+    return local + list_eleven()
+
+
+def list_eleven() -> list[dict]:
+    """ElevenLabs voices, if a key is present. Cached; empty list is a valid answer."""
+    global _eleven_cache
+    key = os.getenv("ELEVENLABS_API_KEY")
+    if not key:
+        return []
+    if not _eleven_cache:
+        try:
+            r = httpx.get(f"{ELEVEN_URL}/v2/voices", headers={"xi-api-key": key},
+                          params={"page_size": 30}, timeout=15)
+            r.raise_for_status()
+            _eleven_cache = [{"id": f"11l:{v['voice_id']}",
+                              "label": f"{v.get('name', v['voice_id'])}  (ElevenLabs)"}
+                             for v in r.json().get("voices", [])]
+        except Exception:
+            return []
+    return _eleven_cache
+
+
+def synthesize(text: str, voice_id: str, out_path: Path) -> None:
+    """Render `text` to a wav at `out_path` using whichever provider the id names."""
+    if voice_id.startswith("11l:"):
+        key = os.getenv("ELEVENLABS_API_KEY")
+        if not key:
+            raise RuntimeError("No ELEVENLABS_API_KEY in ~/voice-loop/.env")
+        r = httpx.post(
+            f"{ELEVEN_URL}/v1/text-to-speech/{voice_id.split(':', 1)[1]}",
+            headers={"xi-api-key": key, "Content-Type": "application/json"},
+            params={"output_format": "pcm_24000"},
+            json={"text": text,
+                  "model_id": os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")},
+            timeout=60,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:180]}")
+        # pcm_24000 is raw signed 16-bit mono LE, so just put a wav header on it
+        with wave.open(str(out_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)
+            wf.writeframes(r.content)
+    else:
+        stem = voice_id.split(":", 1)[1] if ":" in voice_id else voice_id
+        with wave.open(str(out_path), "wb") as wf:
+            get_voice(stem).synthesize_wav(text, wf)
 
 
 def list_claude() -> list[dict]:
@@ -189,9 +256,8 @@ def _pipeline() -> dict:
     state["status"] = "speaking"
     s = time.time()
     spoken = WORK / f"{stamp}_reply.wav"
-    with wave.open(str(spoken), "wb") as wf:
-        get_voice(config["voice"]).synthesize_wav(reply, wf)
-    t["piper"] = round(time.time() - s, 2)
+    synthesize(reply, config["voice"], spoken)
+    t["tts"] = round(time.time() - s, 2)
     # No -D: goes through `default`, which is where the softvol volume lives.
     subprocess.run(["aplay", "-q", str(spoken)], check=False)
 
@@ -278,11 +344,12 @@ async def set_config(body: dict):
     for k in ("whisper", "voice", "claude"):
         if k in body and body[k]:
             config[k] = body[k]
-    if "voice" in body and body["voice"]:
+    if body.get("voice", "").startswith("piper:"):
         try:
-            get_voice(config["voice"])          # warm it so the next turn is fast
+            get_voice(config["voice"].split(":", 1)[1])   # warm it for the next turn
         except Exception as e:
             return JSONResponse({"error": f"could not load voice: {e}"}, status_code=400)
+    save_config()
     return {"active": config}
 
 
