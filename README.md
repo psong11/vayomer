@@ -1,4 +1,4 @@
-# voice-loop
+# vayomer
 
 Bare-bones push-to-talk voice assistant running on **petsi** (Raspberry Pi 5).
 
@@ -48,5 +48,5 @@ loudness. Adjust:
 
 ## Service
 
-    sudo systemctl status voice-loop
-    journalctl -u voice-loop -f
+    sudo systemctl status vayomer
+    journalctl -u vayomer -f

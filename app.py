@@ -25,6 +25,9 @@ load_dotenv(ROOT / ".env")
 
 CAPTURE_DEV = os.getenv("CAPTURE_DEV", "hw:2,0")   # raw card; softvol is playback-only
 WHISPER_BIN = ROOT / "whisper.cpp/build/bin/whisper-cli"
+# whisper-cli has an absolute RUNPATH baked in at build time, so it stops finding
+# libwhisper.so if the project directory is ever moved. Point it at its own folder.
+WHISPER_ENV = {**os.environ, "LD_LIBRARY_PATH": str(ROOT / "whisper.cpp/build/bin")}
 WHISPER_DIR = ROOT / "whisper.cpp/models"
 VOICE_DIR = ROOT / "voices"
 WHISPER_MODEL = Path(os.getenv("WHISPER_MODEL", WHISPER_DIR / "ggml-base.en.bin"))
@@ -236,7 +239,7 @@ def _pipeline() -> dict:
     state["status"] = "transcribing"
     s = time.time()
     out = _run([str(WHISPER_BIN), "-m", str(WHISPER_DIR / config["whisper"]),
-                "-f", str(mono), "-t", "4", "-nt"])
+                "-f", str(mono), "-t", "4", "-nt"], env=WHISPER_ENV)
     transcript = " ".join(out.stdout.split()).strip()
     t["whisper"] = round(time.time() - s, 2)
     state["transcript"] = transcript
