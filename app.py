@@ -15,7 +15,7 @@ from pathlib import Path
 import anthropic
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 ROOT = Path(__file__).parent
@@ -199,15 +199,22 @@ async def stop():
 
 
 @app.get("/events")
-async def events():
+async def events(request: Request):
     async def gen():
-        while True:
-            yield "data: " + json.dumps({
-                "recording": state["recording"],
-                "level": round(state["level"], 4),
-                "status": state["status"],
-            }) + "\n\n"
-            await asyncio.sleep(0.05)
+        try:
+            while True:
+                # Without this the generator never returns, and a single open tab
+                # makes `systemctl restart` hang waiting for the connection.
+                if await request.is_disconnected():
+                    return
+                yield "data: " + json.dumps({
+                    "recording": state["recording"],
+                    "level": round(state["level"], 4),
+                    "status": state["status"],
+                }) + "\n\n"
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            return
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
