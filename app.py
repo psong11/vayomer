@@ -119,6 +119,10 @@ def _pipeline() -> dict:
                 "error": "Didn't catch any speech in that."}
 
     state["status"] = "thinking"
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise RuntimeError(
+            "No ANTHROPIC_API_KEY. Put it in ~/voice-loop/.env, then: "
+            "sudo systemctl restart voice-loop")
     s = time.time()
     resp = client.beta.messages.create(
         model="claude-opus-5",
@@ -174,8 +178,24 @@ async def stop():
     if _thread:
         _thread.join(timeout=3)
     state["status"] = "converting"
-    result = await asyncio.to_thread(_pipeline)
-    return result
+    try:
+        return await asyncio.to_thread(_pipeline)
+    except subprocess.CalledProcessError as e:
+        state["status"] = "idle"
+        detail = (e.stderr or "").strip().splitlines()[-1:] or [str(e)]
+        return JSONResponse({"transcript": state["transcript"],
+                             "error": f"{Path(e.cmd[0]).name} failed: {detail[0]}"},
+                            status_code=500)
+    except anthropic.APIStatusError as e:
+        state["status"] = "idle"
+        hint = " Check the key in ~/voice-loop/.env." if e.status_code == 401 else ""
+        return JSONResponse({"transcript": state["transcript"],
+                             "error": f"Claude API {e.status_code}.{hint}"}, status_code=500)
+    except Exception as e:
+        state["status"] = "idle"
+        msg = str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
+        return JSONResponse({"transcript": state["transcript"], "error": msg},
+                            status_code=500)
 
 
 @app.get("/events")
