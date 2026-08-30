@@ -14,6 +14,7 @@ from pathlib import Path
 
 import anthropic
 import numpy as np
+from piper import PiperVoice
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -49,6 +50,9 @@ _proc: subprocess.Popen | None = None
 _thread: threading.Thread | None = None
 
 client = anthropic.Anthropic()
+# Loaded once at startup. Shelling out to `python -m piper` per reply re-read the
+# 63 MB ONNX model every time, which cost ~2.4 s of the round trip.
+voice = PiperVoice.load(str(PIPER_VOICE))
 app = FastAPI()
 
 
@@ -143,8 +147,8 @@ def _pipeline() -> dict:
     state["status"] = "speaking"
     s = time.time()
     spoken = WORK / f"{stamp}_reply.wav"
-    _run([str(VENV_PY), "-m", "piper", "-m", str(PIPER_VOICE), "-f", str(spoken)],
-         input=reply)
+    with wave.open(str(spoken), "wb") as wf:
+        voice.synthesize_wav(reply, wf)
     t["piper"] = round(time.time() - s, 2)
     # No -D: goes through `default`, which is where the softvol volume lives.
     subprocess.run(["aplay", "-q", str(spoken)], check=False)
