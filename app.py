@@ -183,6 +183,38 @@ def list_claude() -> list[dict]:
     return _claude_models
 
 
+# Not every model accepts the same request options: `fallbacks` is Opus 5 / Fable 5
+# only, and `effort` is rejected by Haiku 4.5 and older. Rather than hardcode a table
+# that goes stale as models ship, start optimistic, drop whatever the API rejects,
+# and remember the answer per model.
+_model_caps: dict[str, dict] = {}
+
+
+def ask_claude(model: str, transcript: str):
+    caps = _model_caps.setdefault(model, {"fallbacks": True, "effort": True})
+    for _ in range(3):
+        kw: dict = {}
+        if caps["fallbacks"]:
+            kw["betas"] = ["server-side-fallback-2026-07-01"]
+            kw["fallbacks"] = "default"
+        if caps["effort"]:
+            kw["output_config"] = {"effort": "low"}  # spoken reply: latency beats depth
+        try:
+            return client.beta.messages.create(
+                model=model, max_tokens=1024, system=SYSTEM,
+                messages=[{"role": "user", "content": transcript}], **kw)
+        except anthropic.BadRequestError as e:
+            msg = str(e)
+            if "fallbacks" in msg and caps["fallbacks"]:
+                caps["fallbacks"] = False
+                continue
+            if "effort" in msg and caps["effort"]:
+                caps["effort"] = False
+                continue
+            raise
+    raise RuntimeError(f"{model} rejected the request options")
+
+
 def _capture_loop() -> None:
     """Read raw frames from arecord; feed both the level meter and the buffer."""
     global _proc
@@ -255,15 +287,7 @@ def _pipeline() -> dict:
             "No ANTHROPIC_API_KEY. Put it in ~/voice-loop/.env, then: "
             "sudo systemctl restart voice-loop")
     s = time.time()
-    resp = client.beta.messages.create(
-        model=config["claude"],
-        max_tokens=1024,
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-        output_config={"effort": "low"},     # spoken reply: latency beats depth
-        system=SYSTEM,
-        messages=[{"role": "user", "content": transcript}],
-    )
+    resp = ask_claude(config["claude"], transcript)
     if resp.stop_reason == "refusal":
         reply = "Sorry, I can't help with that one."
     else:
@@ -319,9 +343,14 @@ async def stop():
                             status_code=500)
     except anthropic.APIStatusError as e:
         state["status"] = "idle"
-        hint = " Check the key in ~/voice-loop/.env." if e.status_code == 401 else ""
+        try:
+            detail = e.response.json()["error"]["message"]
+        except Exception:
+            detail = str(e)[:200]
+        hint = " Check the key in ~/vayomer/.env." if e.status_code == 401 else ""
         return JSONResponse({"transcript": state["transcript"],
-                             "error": f"Claude API {e.status_code}.{hint}"}, status_code=500)
+                             "error": f"Claude API {e.status_code}: {detail}{hint}"},
+                            status_code=500)
     except Exception as e:
         state["status"] = "idle"
         msg = str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
