@@ -100,6 +100,7 @@
     font:13px/1.2 ui-monospace,Menlo,monospace; cursor:pointer;
   }
   .settings select:hover{border-color:var(--dim)}
+  .devices{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
   .settings select:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
   .io{width:100%; max-width:640px; display:flex; flex-direction:column; gap:12px}
   .card{
@@ -133,6 +134,17 @@
   <div class="flowwrap">
     <div class="flow" id="flow" role="img" aria-label="Pipeline progress"></div>
     <p class="flownote">solid ring = runs on petsi · dashed ring = leaves the box</p>
+  </div>
+
+  <div class="settings devices">
+    <label>Input<select id="d-input">
+      <option value="petsi">petsi \u2014 I2S mic</option>
+      <option value="browser">this device \u2014 browser mic</option>
+    </select></label>
+    <label>Output<select id="d-output">
+      <option value="petsi">petsi \u2014 NS4168 speaker</option>
+      <option value="browser">this device \u2014 browser audio</option>
+    </select></label>
   </div>
 
   <div class="settings">
@@ -207,6 +219,7 @@ es.onmessage=e=>{
   const d=JSON.parse(e.data);
   // Read the tail BEFORE shifting: after shift() index N-1 no longer exists, and
   // undefined*0.86 is NaN, which poisons the whole array and draws nothing.
+  if(localCapture){ renderFlow(d.stages); return; }   // local meter owns the waveform
   const tail = levels[levels.length - 1];
   levels.shift();
   const next = d.recording ? d.level : (Number.isFinite(tail) ? tail * 0.86 : IDLE);
@@ -247,25 +260,119 @@ async function loadModels(){
       };
     };
     fill("whisper",m.whisper); fill("claude",m.claude); fill("voice",m.voices);
+    if(m.active.input)  dIn.value  = m.active.input;
+    if(m.active.output) dOut.value = m.active.output;
+    if(dIn.value==="browser" && !micOK){ dIn.value="petsi"; applyDevices(); show("err", micHelp()); }
     if(m.notice) show("err", m.notice);
   }catch(e){ show("err","Could not load the model list: "+e.message); }
 }
 loadModels();
+
+// --- device toggles -------------------------------------------------------
+const dIn=document.getElementById("d-input"), dOut=document.getElementById("d-output");
+const micOK = window.isSecureContext &&
+              !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+let mediaRec=null, mediaStream=null, chunks=[], audioCtx=null, analyser=null, rafId=0;
+let localCapture=false;
+
+function micHelp(){
+  return "This page is on plain http, so the browser blocks microphone access. "+
+         "Either reach it at http://localhost:8080 through an SSH tunnel "+
+         "(ssh -L 8080:localhost:8080 paul@petsi.local), or enable HTTPS "+
+         "certificates for your tailnet and serve it over https.";
+}
+
+async function applyDevices(){
+  await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({input:dIn.value, output:dOut.value})});
+}
+dIn.onchange=async()=>{
+  if(dIn.value==="browser" && !micOK){ show("err", micHelp()); dIn.value="petsi"; }
+  else show("err","");
+  applyDevices();
+};
+dOut.onchange=()=>{ applyDevices(); };
+
+function meterFromStream(stream){
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  const srcNode = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  srcNode.connect(analyser);
+  const buf = new Float32Array(analyser.fftSize);
+  let last = 0;
+  const tick = (ts)=>{
+    if(!localCapture) return;
+    if(ts - last > 50){                       // match the server's 20 Hz cadence
+      analyser.getFloatTimeDomainData(buf);
+      let sum=0; for(let i=0;i<buf.length;i++) sum += buf[i]*buf[i];
+      const rms = Math.sqrt(sum/buf.length);
+      levels.shift(); levels.push(Math.max(IDLE, Math.min(1, rms*6)));
+      last = ts;
+    }
+    rafId = requestAnimationFrame(tick);
+  };
+  rafId = requestAnimationFrame(tick);
+}
+
+function stopStream(){
+  localCapture=false;
+  if(rafId) cancelAnimationFrame(rafId), rafId=0;
+  if(audioCtx) audioCtx.close().catch(()=>{}), audioCtx=null;
+  if(mediaStream) mediaStream.getTracks().forEach(t=>t.stop()), mediaStream=null;
+}
+
+async function startBrowserMic(){
+  mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
+  chunks=[];
+  mediaRec = new MediaRecorder(mediaStream);
+  mediaRec.ondataavailable = e=>{ if(e.data.size) chunks.push(e.data); };
+  mediaRec.start();
+  localCapture = true;
+  document.documentElement.style.setProperty("--accent","var(--listen)");
+  accentVar="--listen"; statusEl.textContent="listening…";
+  meterFromStream(mediaStream);
+}
+
+function stopBrowserMic(){
+  return new Promise(res=>{
+    mediaRec.onstop = ()=>{ stopStream(); res(new Blob(chunks, {type: mediaRec.mimeType||"audio/webm"})); };
+    mediaRec.stop();
+  });
+}
+
+async function playReply(url){
+  try{ const a=new Audio(url); a.play(); }
+  catch(e){ show("err","Could not play the reply here: "+e.message); }
+}
 
 btn.onclick=async()=>{
   if(busy) return;
   if(!recording){
     show("you",""); show("reply",""); show("err","");
     document.getElementById("timings").textContent="";
-    const r=await fetch("/start",{method:"POST"});
-    if(!r.ok){show("err","Could not start the microphone.");return;}
+    if(dIn.value==="browser"){
+      try{ await startBrowserMic(); }
+      catch(e){ show("err","Microphone unavailable: "+e.message+" — "+micHelp()); return; }
+    }else{
+      const r=await fetch("/start",{method:"POST"});
+      if(!r.ok){show("err","Could not start the microphone.");return;}
+    }
     recording=true; btn.textContent="Stop and send";
   }else{
     recording=false; busy=true;
     btn.disabled=true; btn.textContent="Working…";
     try{
-      const r=await fetch("/stop",{method:"POST"});
+      let r;
+      if(dIn.value==="browser"){
+        const blob=await stopBrowserMic();
+        const fd=new FormData(); fd.append("audio", blob, "turn.webm");
+        r=await fetch("/turn",{method:"POST",body:fd});
+      }else{
+        r=await fetch("/stop",{method:"POST"});
+      }
       const d=await r.json();
+      if(d.audio) playReply(d.audio);
       show("you", d.transcript); show("reply", d.reply); show("err", d.error);
       if(d.timings&&d.timings.total){
         const t=d.timings, u=d.used||{};

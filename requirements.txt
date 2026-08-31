@@ -1,7 +1,8 @@
-fastapi
-uvicorn[standard]
 anthropic
-python-dotenv
-piper-tts
-numpy
+fastapi
 httpx
+numpy
+piper-tts
+python-dotenv
+python-multipart
+uvicorn[standard]

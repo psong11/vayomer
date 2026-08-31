@@ -17,7 +17,7 @@ import httpx
 import numpy as np
 from piper import PiperVoice
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 ROOT = Path(__file__).parent
@@ -38,7 +38,9 @@ PIPER_VOICE = Path(os.getenv("PIPER_VOICE", VOICE_DIR / "en_US-lessac-medium.onn
 CONFIG_FILE = ROOT / "work/config.json"
 config = {"whisper": WHISPER_MODEL.name,
           "voice": f"piper:{PIPER_VOICE.stem}",
-          "claude": os.getenv("CLAUDE_MODEL", "claude-opus-5")}
+          "claude": os.getenv("CLAUDE_MODEL", "claude-opus-5"),
+          "input": "petsi",     # "petsi" = I2S mic, "browser" = the viewing device
+          "output": "petsi"}    # "petsi" = NS4168 speaker, "browser" = the viewing device
 try:
     config.update({k: v for k, v in json.loads(CONFIG_FILE.read_text()).items()
                    if k in config})
@@ -273,32 +275,40 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, check=True, **kw)
 
 
-def _pipeline() -> dict:
-    """Blocking: wav -> 16k mono -> whisper -> Claude -> piper -> speaker."""
+def _pipeline(src: Path | None = None) -> dict:
+    """Blocking: audio -> 16k mono -> whisper -> Claude -> TTS -> speaker.
+
+    `src` is a file uploaded from the browser's microphone; when it is None the
+    audio comes from the I2S mic buffer instead.
+    """
     stamp = int(time.time())
     t = {}
-    with _buf_lock:
-        pcm = bytes(_buf)
 
-    if len(pcm) < RATE * CHANNELS * WIDTH * 0.3:      # under ~0.3 s
-        state["status"] = "idle"
-        return {"error": "That was too short to hear. Hold the button while you talk."}
+    if src is None:
+        with _buf_lock:
+            pcm = bytes(_buf)
+        if len(pcm) < RATE * CHANNELS * WIDTH * 0.3:      # under ~0.3 s
+            state["status"] = "idle"
+            return {"error": "That was too short to hear. Hold the button while you talk."}
+        src = WORK / f"{stamp}_raw.wav"
+        with wave.open(str(src), "wb") as w:
+            w.setnchannels(CHANNELS)
+            w.setsampwidth(WIDTH)
+            w.setframerate(RATE)
+            w.writeframes(pcm)
+        # The I2S mic sits in the LEFT slot and the right is silence, so take the
+        # left channel explicitly -- plain -ac 1 would average in the silence and
+        # quietly cost 6 dB. Browser audio is ordinary, so it needs no such fix.
+        chan = ["-af", "pan=mono|c0=c0"]
+    else:
+        chan = []
 
-    raw_wav = WORK / f"{stamp}_raw.wav"
-    with wave.open(str(raw_wav), "wb") as w:
-        w.setnchannels(CHANNELS)
-        w.setsampwidth(WIDTH)
-        w.setframerate(RATE)
-        w.writeframes(pcm)
-
-    # Take the LEFT channel explicitly. Plain -ac 1 averages L+R, and since the
-    # right slot is silence that would quietly cost 6 dB of signal.
     stage("convert", "active")
     state["status"] = "converting"
     mono = WORK / f"{stamp}_16k.wav"
     s = time.time()
-    _run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw_wav),
-          "-af", "pan=mono|c0=c0", "-ar", "16000", "-ac", "1", str(mono)])
+    _run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+          *chan, "-ar", "16000", "-ac", "1", str(mono)])
     t["convert"] = round(time.time() - s, 2)
     stage("convert", "done", "48k stereo \u2192 16k mono", t["convert"])
 
@@ -344,13 +354,19 @@ def _pipeline() -> dict:
         spoken_secs = _w.getnframes() / _w.getframerate()
     stage("tts", "done", vlabel, t["tts"])
 
-    stage("speaker", "active", f"{spoken_secs:.1f}s out")
-    state["status"] = "playing"
-    s = time.time()
-    # No -D: goes through `default`, which is where the softvol volume lives.
-    subprocess.run(["aplay", "-q", str(spoken)], check=False)
-    t["play"] = round(time.time() - s, 2)
-    stage("speaker", "done", f"{spoken_secs:.1f}s out", t["play"])
+    audio_url = None
+    if config["output"] == "browser":
+        # Hand the wav back and let the page play it; nothing goes to the amp.
+        stage("speaker", "done", f"{spoken_secs:.1f}s \u2192 browser", 0.0)
+        audio_url = f"/reply/{spoken.name}"
+    else:
+        stage("speaker", "active", f"{spoken_secs:.1f}s out")
+        state["status"] = "playing"
+        s = time.time()
+        # No -D: goes through `default`, which is where the softvol volume lives.
+        subprocess.run(["aplay", "-q", str(spoken)], check=False)
+        t["play"] = round(time.time() - s, 2)
+        stage("speaker", "done", f"{spoken_secs:.1f}s out", t["play"])
 
     # `play` is how long the reply takes to speak aloud, not latency -- keep it
     # visible per-stage but out of the total, which is time-to-first-sound.
@@ -358,7 +374,7 @@ def _pipeline() -> dict:
     state["timings"] = t
     state["status"] = "idle"
     return {"transcript": transcript, "reply": reply, "timings": t,
-            "used": dict(config)}
+            "used": dict(config), "audio": audio_url}
 
 
 @app.post("/start")
@@ -376,34 +392,18 @@ async def start():
     return {"ok": True}
 
 
-@app.post("/stop")
-async def stop():
-    if not state["recording"]:
-        return JSONResponse({"error": "not recording"}, status_code=409)
-    state["recording"] = False
-    if _proc and _proc.poll() is None:
-        _proc.terminate()                 # unblocks the thread's pending read
-    if _thread:
-        _thread.join(timeout=3)
-    secs = len(_buf) / (RATE * CHANNELS * WIDTH)
-    stage("capture", "done", f"{secs:.1f}s audio", secs)
-    state["status"] = "converting"
+async def _finish(src: Path | None = None):
+    """Run the pipeline off the event loop, turning any failure into a clean message."""
     try:
-        return await asyncio.to_thread(_pipeline)
+        return await asyncio.to_thread(_pipeline, src)
     except subprocess.CalledProcessError as e:
-        for k, v in state["stages"].items():
-            if v["state"] == "active":
-                v["state"] = "failed"
-        state["status"] = "idle"
+        _fail_active()
         detail = (e.stderr or "").strip().splitlines()[-1:] or [str(e)]
         return JSONResponse({"transcript": state["transcript"],
                              "error": f"{Path(e.cmd[0]).name} failed: {detail[0]}"},
                             status_code=500)
     except anthropic.APIStatusError as e:
-        for k, v in state["stages"].items():
-            if v["state"] == "active":
-                v["state"] = "failed"
-        state["status"] = "idle"
+        _fail_active()
         try:
             detail = e.response.json()["error"]["message"]
         except Exception:
@@ -413,13 +413,54 @@ async def stop():
                              "error": f"Claude API {e.status_code}: {detail}{hint}"},
                             status_code=500)
     except Exception as e:
-        for k, v in state["stages"].items():
-            if v["state"] == "active":
-                v["state"] = "failed"
-        state["status"] = "idle"
+        _fail_active()
         msg = str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
         return JSONResponse({"transcript": state["transcript"], "error": msg},
                             status_code=500)
+
+
+def _fail_active() -> None:
+    for v in state["stages"].values():
+        if v["state"] == "active":
+            v["state"] = "failed"
+    state["status"] = "idle"
+
+
+@app.post("/stop")
+async def stop():
+    """Finish a turn captured on petsi's own microphone."""
+    if not state["recording"]:
+        return JSONResponse({"error": "not recording"}, status_code=409)
+    state["recording"] = False
+    if _proc and _proc.poll() is None:
+        _proc.terminate()                 # unblocks the thread's pending read
+    if _thread:
+        _thread.join(timeout=3)
+    secs = len(_buf) / (RATE * CHANNELS * WIDTH)
+    stage("capture", "done", f"{secs:.1f}s \u00b7 petsi mic", secs)
+    state["status"] = "converting"
+    return await _finish()
+
+
+@app.post("/turn")
+async def turn(audio: UploadFile = File(...)):
+    """Finish a turn recorded by the browser and uploaded as one blob."""
+    reset_stages()
+    data = await audio.read()
+    up = WORK / f"{int(time.time())}_upload"
+    up.write_bytes(data)
+    stage("capture", "done", f"{len(data)/1024:.0f} KB \u00b7 browser mic", None)
+    state["status"] = "converting"
+    return await _finish(up)
+
+
+@app.get("/reply/{name}")
+async def reply_audio(name: str):
+    """Serve a synthesized reply so the browser can play it."""
+    f = (WORK / name).resolve()
+    if f.parent != WORK.resolve() or not f.is_file():   # no path traversal
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(f, media_type="audio/wav")
 
 
 @app.get("/events")
@@ -469,7 +510,7 @@ async def models():
 
 @app.post("/config")
 async def set_config(body: dict):
-    for k in ("whisper", "voice", "claude"):
+    for k in ("whisper", "voice", "claude", "input", "output"):
         if k in body and body[k]:
             config[k] = body[k]
     if body.get("voice", "").startswith("piper:"):
