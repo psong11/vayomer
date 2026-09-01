@@ -8,8 +8,22 @@ Only the Claude call leaves the machine. STT and TTS are local.
 
 ## Use
 
-Open <http://petsi.local:8080> (or the tailnet IP). Click **Start talking**, speak,
-click **Stop and send**. The bars are the live mic level streamed from petsi over SSE —
+Two ways in:
+
+| URL | Browser mic works? |
+|---|---|
+| **<https://petsi.tail835063.ts.net>** (tailnet, real cert) | **yes** |
+| <http://petsi.local:8080> (LAN, plain http) | no — not a secure context |
+
+The HTTPS address is `tailscale serve` proxying to port 8080. It is **tailnet-only**,
+not public, and Tailscale renews the certificate itself. It survives reboots; to
+inspect or remove it: `tailscale serve status` / `tailscale serve --https=443 off`.
+
+Browser *speaker* output works from either address; only microphone capture is gated
+on a secure context. Without HTTPS you can also tunnel it, since localhost counts as
+secure: `ssh -L 8080:localhost:8080 paul@petsi.local`, then <http://localhost:8080>. Click **Start talking**, speak, click **Stop and send**.
+The **Input** and **Output** pickers switch the mic and speaker between petsi's
+hardware and whatever device you are viewing on, independently. The bars are the live mic level streamed from petsi over SSE —
 the browser never touches your microphone, so no HTTPS is needed.
 
 ## Layout
