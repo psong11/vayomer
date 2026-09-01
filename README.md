@@ -6,6 +6,11 @@ Bare-bones push-to-talk voice assistant running on **petsi** (Raspberry Pi 5).
 
 Only the Claude call leaves the machine. STT and TTS are local.
 
+![The rig: the INMP441 microphone held in hand, the Raspberry Pi 5 behind it, and the NS4168 amplifier driving the small speaker, all wired across a breadboard](docs/rig.jpg)
+
+*All of it. The microphone in hand, the Pi behind it, the amplifier board and speaker
+on the right. The two clock lines are the ones that fan out to both boards.*
+
 ## Use
 
 Two ways in:
