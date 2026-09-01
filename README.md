@@ -2,7 +2,7 @@
 
 Bare-bones push-to-talk voice assistant running on **petsi** (Raspberry Pi 5).
 
-    INMP441 mic ──I2S──> petsi ──> whisper.cpp ──> Claude Opus 5 ──> piper ──> NS4168 amp ──> speaker
+    INMP441 mic ──I2S──> petsi ──> whisper.cpp ──> Claude ──> piper/ElevenLabs ──> NS4168 amp ──> speaker
 
 Only the Claude call leaves the machine. STT and TTS are local.
 
